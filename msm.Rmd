@@ -1,0 +1,156 @@
+---
+title: "Marginal Structural Models: A MIMIC-III Workshop"
+author: "C.V. Cosgriff, MD, MPH"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+---
+
+For this example we'll use the dataset which was used in the following
+study by Hsu and collegues:
+
+_Hsu DJ, Feng M, Kothari R, Zhou H, Chen KP, Celi LA. The association between indwelling arterial catheters and mortality in hemodynamically stable patients with respiratory failure: a propensity score analysis. CHEST Journal. 2015 Dec 1;148(6):1470-6._
+
+We previously extracted the requisite data, and will load it now along with the
+requisite libraries.
+```{r message=FALSE, error=FALSE}
+library(dplyr)
+library(readr)
+library(sandwich)
+
+aline_tbl <- read_csv('./aline_data.csv')
+```
+
+We will be focusing on the following research question: __what is the _causal effect_
+of indwelling cathethers and mortality in hemodynamically stable patients with
+respiratory failure?__
+
+The exposure, $A$, will be `aline_flg`, a binary variable indicating whether or
+not the patient had an indwelling arterial cathether. 
+
+$L$ will be a vector composed of the variables age, gender, weight on first day, 
+SOFA score, whether the patient was on a surgical service, time in the ICU, 
+indicators for the presence of disease including CHF, AFib, CKD, liver disease,
+COPD, CAD, stroke, malignancy, and first day vital sign and laboratory data.  
+
+We will now format our data. We first designate our categorical variables, and
+then we exclude all unnecessary variables from our dataset.
+```{r}
+aline_tbl$day_28_flag <- factor(aline_tbl$day_28_flag, levels=c(0, 1))
+aline_tbl$gender <- factor(aline_tbl$gender, levels=c('F', 'M'))
+aline_tbl$day_icu_intime <- factor(aline_tbl$day_icu_intime)
+aline_tbl$hour_icu_intime <- factor(aline_tbl$hour_icu_intime)
+aline_tbl$icu_hour_flag <- factor(aline_tbl$icu_hour_flag, levels=c(0, 1))
+aline_tbl$sedative_flag <- factor(aline_tbl$sedative_flag, levels=c(0, 1))
+aline_tbl$fentanyl_flag <- factor(aline_tbl$fentanyl_flag, levels=c(0, 1))
+aline_tbl$midazolam_flag <- factor(aline_tbl$midazolam_flag, levels=c(0, 1))
+aline_tbl$propofol_flag <- factor(aline_tbl$propofol_flag, levels=c(0, 1))
+aline_tbl$chf_flag <- factor(aline_tbl$chf_flag, levels=c(0, 1))
+aline_tbl$afib_flag <- factor(aline_tbl$afib_flag, levels=c(0, 1))
+aline_tbl$renal_flag <- factor(aline_tbl$renal_flag, levels=c(0, 1))
+aline_tbl$liver_flag <- factor(aline_tbl$liver_flag, levels=c(0, 1))
+aline_tbl$copd_flag <- factor(aline_tbl$copd_flag, levels=c(0, 1))
+aline_tbl$cad_flag <- factor(aline_tbl$cad_flag, levels=c(0, 1))
+aline_tbl$stroke_flag <- factor(aline_tbl$stroke_flag, levels=c(0, 1))
+aline_tbl$malignancy_flag <- factor(aline_tbl$malignancy_flag, levels=c(0, 1))
+aline_tbl$respfail_flag <- factor(aline_tbl$respfail_flag, levels=c(0, 1))
+aline_tbl$ards_flag <- factor(aline_tbl$ards_flag, levels=c(0, 1))
+aline_tbl$pneumonia_flag <- factor(aline_tbl$pneumonia_flag, levels=c(0, 1))
+aline_tbl$service_surg <- factor(aline_tbl$service_unit == 'SURG', levels=c(FALSE, TRUE))
+
+aline_tbl <- aline_tbl %>% select(aline_flag, 
+                  age, gender, weight_first, sofa_first, service_surg, 
+                  day_icu_intime, hour_icu_intime, 
+                  chf_flag, afib_flag, renal_flag, 
+                  liver_flag, copd_flag, cad_flag, stroke_flag, 
+                  malignancy_flag, respfail_flag, 
+                  map_first, hr_first, temp_first, spo2_first, 
+                  bun_first, chloride_first, creatinine_first, 
+                  hgb_first, platelet_first, 
+                  potassium_first, sodium_first, tco2_first, wbc_first,
+                  day_28_flag)
+```
+
+
+__We make the assumption that adjustment for $L$ ensures conditional exchangeability.__
+  
+We will use inverse probability weights (IPW) to construct a __marginal structural model.__
+
+The weights will be defined as follows:
+$$W^a = \frac{1}{f(A|L)}$$
+
+The denominator will be estimated by way of the following logistic regression
+model:
+$$\sigma(Pr[A=1|L]) = \beta_0 + \beta_LL$$
+
+```{r}
+propensity_glm <- glm(aline_flag ~ ., family = binomial(link = 'logit'), 
+                      data = aline_tbl %>% select(-day_28_flag))
+prA1L <- predict(propensity_glm, aline_tbl, type = 'response')
+prA0L <- 1 - prA1L
+```
+
+The following modeling assumptions apply to this model:  
+1) With respect to the continuous variables in $L$, the association between 
+these variables is assumed linear with the log odds of the probability of being treated.  
+2) The contribution of all of the covariates in $L$ to the probability of
+recieving an IAC is additive on the log odds scale.   
+
+We then assign the appropriate weight to each subject.
+```{r}
+aline_tbl <- aline_tbl %>% 
+  mutate(wa = ifelse(aline_flag == 1, 1/prA1L, 1/prA0L))
+```
+
+We want to estimate the parameters of the following marginal structural model:
+$$\sigma(Pr[Y^a]) = \theta_0 + \theta_1A$$
+
+We estimate the parameters of the marginal structural model by fitting the 
+following logistic regression model weighted by our IPW:
+$$\sigma(Pr[Y|A]) = \theta_0 + \theta_1A$$
+
+```{r warning=FALSE, message=FALSE}
+msm_glm <- glm(day_28_flag ~ aline_flag, weights = wa, 
+               family = binomial(link = 'logit'), data = aline_tbl)
+```
+
+This final model is non-parametric, and thus no _modeling_ assumptions were made.  
+
+Before we examine our result we also want to construct 95% confidence intervals.
+However, we have violated a fundamental assumptions of generalized linear models:
+independence of the samples; we have done this via weighting. Because some samples
+count for more than 1 and others for less than 1, we will have correlation which
+will artificially shrink our confidence intervals. We will therefore construct a
+robust confidence interval. For this take we will use the sandwich estimator
+to estimate the variance robustly and then construct the condience intervals.
+
+```{r}
+se <- sqrt(diag(vcovHC(msm_glm, type = 'HC0')))
+upper_ci <- coef(msm_glm) + qnorm((1 - 0.95)/2, lower.tail = F)*se
+lower_ci <- coef(msm_glm) - qnorm((1 - 0.95)/2, lower.tail = F)*se
+```
+
+With these calculated, we output the final result.
+```{r}
+result <- data.frame(beta_1 = round(exp(coef(msm_glm)[2]), 4), round(exp(lower_ci[2]), 4), 
+           round(exp(upper_ci[2]), 4))
+result %>%
+  knitr::kable(col.names = c('Estimate', 'Lower 95% CI', 'Upper 95% CI'), 
+               row.names = F)
+```
+
+__Interpretation:__ The the odds of death at 28 days had everyone in the study 
+recieved an IAC was `r result[1,1]` times the odds of death had everyone in the 
+study not recieved an IAC was equal to  mmHg during the study period. If we 
+were to repeat this study 100 times we would expect that 95 of the produced 
+estimates would fall within the range defined by [`r result[1,2]`, `r result[1,3]`].
+
+
+
+
+
+
+
+
